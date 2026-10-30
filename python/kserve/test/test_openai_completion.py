@@ -574,7 +574,7 @@ class TestOpenAIProxyModelCompletion:
 
 def _reframe(stream: bytes, framing: str) -> bytes:
     """Rewrite an OpenAI SSE fixture the way other OpenAI-compatible servers frame it."""
-    text = stream.decode()
+    text = stream.decode().replace("\r\n", "\n")
     if framing == "keepalive_comment":
         # axum's default SSE keep-alive (used by TGI) is an empty comment line.
         return (":\n\n" + text.replace("\n\n", "\n\n:\n\n", 1)).encode()
@@ -644,3 +644,73 @@ class TestOpenAIProxyModelSSEFraming:
         )
         assert want
         assert got == want
+
+
+UPSTREAM_STREAM_ERRORS = {
+    # vLLM create_streaming_error_response
+    "vllm": (
+        '{"error": {"message": "boom", "type": "BadRequestError", '
+        '"param": null, "code": 400}}',
+        "400",
+        "BadRequestError",
+    ),
+    # TGI into_openai_event
+    "tgi": (
+        '{"error": {"message": "boom", "http_status_code": 422}}',
+        "422",
+        "UpstreamError",
+    ),
+}
+
+
+def _with_error_after_first_event(stream: bytes, error: str) -> bytes:
+    first, rest = stream.decode().replace("\r\n", "\n").split("\n\n", 1)
+    return f"{first}\n\ndata: {error}\n\n{rest}".encode()
+
+
+class TestOpenAIProxyModelStreamErrors:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("upstream", list(UPSTREAM_STREAM_ERRORS))
+    async def test_chat_completion_stream_error_is_passed_through(
+        self,
+        chat_completion_request: ChatCompletionRequest,
+        chat_completion_chunk_stream: bytes,
+        upstream: str,
+    ):
+        error, code, err_type = UPSTREAM_STREAM_ERRORS[upstream]
+        chat_completion_request.stream = True
+
+        def call(model):
+            return model.create_chat_completion(chat_completion_request)
+
+        want = await _proxied_chunks(chat_completion_chunk_stream, call)
+        got = await _proxied_chunks(
+            _with_error_after_first_event(chat_completion_chunk_stream, error), call
+        )
+        assert got[0] == want[0]
+        assert isinstance(got[1], ErrorResponse)
+        assert got[1].error.message == "boom"
+        assert got[1].error.code == code
+        assert got[1].error.type == err_type
+        assert got[2:] == want[1:]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("upstream", list(UPSTREAM_STREAM_ERRORS))
+    async def test_completion_stream_error_is_passed_through(
+        self,
+        completion_request: CompletionRequest,
+        completion_chunk_stream: bytes,
+        upstream: str,
+    ):
+        error, code, _ = UPSTREAM_STREAM_ERRORS[upstream]
+        completion_request.stream = True
+
+        def call(model):
+            return model.create_completion(completion_request)
+
+        got = await _proxied_chunks(
+            _with_error_after_first_event(completion_chunk_stream, error), call
+        )
+        assert isinstance(got[1], ErrorResponse)
+        assert got[1].error.code == code
+        assert sum(isinstance(c, ErrorResponse) for c in got) == 1

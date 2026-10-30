@@ -103,6 +103,33 @@ def _sse_data(line: str) -> Optional[str]:
     return data[1:] if data.startswith(" ") else data
 
 
+def _stream_error(data: str) -> Optional[ErrorResponse]:
+    """Return the error an upstream sent in place of a chunk, or None.
+
+    vLLM and TGI report a failure after the stream has started as a
+    ``data: {"error": {...}}`` event, which is not a valid chunk.
+    """
+    if '"error"' not in data:
+        return None
+    try:
+        obj = orjson.loads(data)
+    except orjson.JSONDecodeError:
+        return None
+    error = obj.get("error") if isinstance(obj, dict) else None
+    if not isinstance(error, dict) or "choices" in obj:
+        return None
+    try:
+        status = HTTPStatus(int(error.get("code") or error.get("http_status_code")))
+    except (TypeError, ValueError):
+        status = HTTPStatus.INTERNAL_SERVER_ERROR
+    return create_error_response(
+        str(error.get("message", "")),
+        err_type=str(error.get("type") or "UpstreamError"),
+        param=error.get("param") or "",
+        status_code=status,
+    )
+
+
 class OpenAIProxyModel(OpenAIGenerativeModel):
     """
     An implementation of OpenAIModel that proxies requests to a backend server exposing Open AI endpoints.
@@ -227,6 +254,9 @@ class OpenAIProxyModel(OpenAIGenerativeModel):
         data = _sse_data(raw_chunk)
         if data is None or data == "[DONE]":
             return None
+        error = _stream_error(data)
+        if error is not None:
+            return error
 
         if self.skip_upstream_validation:
             obj = orjson.loads(data)
@@ -245,6 +275,9 @@ class OpenAIProxyModel(OpenAIGenerativeModel):
         data = _sse_data(raw_chunk)
         if data is None or data == "[DONE]":
             return None
+        error = _stream_error(data)
+        if error is not None:
+            return error
         if self.skip_upstream_validation:
             obj = orjson.loads(data)
             chat_completion_chunk = ChatCompletionChunk.model_construct(**obj)
